@@ -235,7 +235,7 @@ def compute_gate_threshold(
     features_df: pd.DataFrame,
     deltas_df: pd.DataFrame,
     scaling_df: pd.DataFrame,
-    percentile: float = 33.0,
+    percentile: float = 47.4,
 ) -> float:
     """
     Compute the score distribution across all bugs and return the
@@ -344,7 +344,7 @@ def parse_args():
     p.add_argument("--deltas",    default="bug_features/all_vs_none_top5.csv", help="Path to all_vs_none_topN.csv (e.g. top5)")
     p.add_argument("--scaling",   default="bug_features/full_dataset_scaling.csv", help="Path to full_dataset_scaling.csv")
     p.add_argument("--threshold", default="top5", help="Threshold label (top1/top5/top10) — informational only")
-    p.add_argument("--gate-percentile", type=float, default=33.0,
+    p.add_argument("--gate-percentile", type=float, default=47.4,
                    help="Percentile of score distribution used as augmentation gate (default: 33)")
     p.add_argument("--output",    default="localizability_scores.csv", help="Output CSV file path")
     return p.parse_args()
