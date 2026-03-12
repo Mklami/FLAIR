@@ -34,6 +34,7 @@ import sys
 import re
 import xml.etree.ElementTree as ET
 from pathlib import Path
+import os, glob, json
 
 import pandas as pd
 import numpy as np
@@ -273,6 +274,25 @@ def compute_gate_threshold(
 # ---------------------------------------------------------------------------
 # Report
 # ---------------------------------------------------------------------------
+def get_augmentation_hints(details_df: pd.DataFrame) -> list:
+    """
+    Extract augmentation hints for weak features (negative contribution).
+    Returns a list of hint strings.
+    """
+    hints = []
+    # Find features with negative contribution that have hints
+    weak = details_df[details_df["contribution"] < 0].copy()
+    weak["abs_contrib"] = weak["contribution"].abs()
+    weak = weak.sort_values("abs_contrib", ascending=False)
+
+    for _, r in weak.iterrows():
+        feat = r["feature"]
+        if feat in AUGMENTATION_HINTS:
+            hints.append(f"{feat}: {AUGMENTATION_HINTS[feat]}")
+
+    return hints
+
+
 def print_report(
     bug_info: dict,
     project: str,
@@ -301,22 +321,14 @@ def print_report(
     if needs_augmentation:
         print()
         print("  Augmentation targets (weakest dimensions to address):")
-        # Find features with negative contribution that have hints
-        weak = details_df[details_df["contribution"] < 0].copy()
-        weak["abs_contrib"] = weak["contribution"].abs()
-        weak = weak.sort_values("abs_contrib", ascending=False)
+        hints = get_augmentation_hints(details_df)
+        for hint in hints[:4]:  # Show up to 4 hints
+            parts = hint.split(": ", 1)
+            if len(parts) == 2:
+                print(f"\n  • {parts[0]}")
+                print(f"    → {parts[1]}")
 
-        shown = 0
-        for _, r in weak.iterrows():
-            feat = r["feature"]
-            if feat in AUGMENTATION_HINTS:
-                print(f"\n  • {feat}")
-                print(f"    → {AUGMENTATION_HINTS[feat]}")
-                shown += 1
-            if shown >= 4:
-                break
-
-        if shown == 0:
+        if not hints:
             print("  (No specific augmentation hints available for weak features.)")
 
     print(f"\n{SEP}\n")
@@ -327,53 +339,123 @@ def print_report(
 # ---------------------------------------------------------------------------
 def parse_args():
     p = argparse.ArgumentParser(description="Score bug report localizability.")
-    p.add_argument("--xml",       required=True,  default="defects4j_xml", help="Path to Defects4J bug report XML")
-    p.add_argument("--features",  required=True,  default="final_feature_set.csv", help="Path to final_feature_set.csv")
-    p.add_argument("--deltas",    required=True,  default="all_vs_none_top5.csv", help="Path to all_vs_none_topN.csv (e.g. top5)")
-    p.add_argument("--scaling",   required=True,  default="full_dataset_scaling.csv", help="Path to full_dataset_scaling.csv")
+    p.add_argument("--xml-dir",   default="defects4j_xml", help="Path to directory containing Defects4J bug report XML files")
+    p.add_argument("--features",  default="bug_features/final_feature_set.csv", help="Path to final_feature_set.csv")
+    p.add_argument("--deltas",    default="bug_features/all_vs_none_top5.csv", help="Path to all_vs_none_topN.csv (e.g. top5)")
+    p.add_argument("--scaling",   default="bug_features/full_dataset_scaling.csv", help="Path to full_dataset_scaling.csv")
     p.add_argument("--threshold", default="top5", help="Threshold label (top1/top5/top10) — informational only")
     p.add_argument("--gate-percentile", type=float, default=33.0,
                    help="Percentile of score distribution used as augmentation gate (default: 33)")
+    p.add_argument("--output",    default="localizability_scores.csv", help="Output CSV file path")
     return p.parse_args()
 
 
 def main():
     args = parse_args()
 
-    xml_path = glob.glob(os.path.join(xml_path, "*.xml"))
-    if not xml_path.exists():
-        sys.exit(f"ERROR: XML file not found: {xml_path}")
+    # Get all XML files in the directory
+    xml_dir = Path(args.xml_dir)
+    if not xml_dir.exists():
+        sys.exit(f"ERROR: XML directory not found: {xml_dir}")
     
-    for file in xml_path:
-    # Derive project and bug_id from filename (e.g. Chart_1.xml)
-        stem = xml_path.stem  # e.g. "Chart_1"
-        parts = stem.rsplit("_", 1)
-        if len(parts) != 2:
-            sys.exit(f"ERROR: Cannot parse project/bug_id from filename '{stem}'. Expected format: Project_N.xml")
-        project, bug_id = parts[0], parts[1]
+    xml_files = sorted(xml_dir.glob("*.xml"))
+    if not xml_files:
+        sys.exit(f"ERROR: No XML files found in {xml_dir}")
 
-        print(f"\nLoading data files...")
-        features_df = pd.read_csv(args.features)
-        deltas_df   = pd.read_csv(args.deltas)
-        scaling_df  = pd.read_csv(args.scaling)
+    print(f"Found {len(xml_files)} XML files to process...")
+    print(f"\nLoading data files...")
+    features_df = pd.read_csv(args.features)
+    deltas_df   = pd.read_csv(args.deltas)
+    scaling_df  = pd.read_csv(args.scaling)
 
-        print(f"Parsing bug report XML (skipping <fixedFiles>)...")
-        bug_info = parse_bug_report(xml_path)
+    # Compute gate threshold once (same for all bugs)
+    print(f"Computing gate threshold (p{args.gate_percentile:.0f} across all bugs)...")
+    gate_threshold = compute_gate_threshold(
+        features_df, deltas_df, scaling_df, args.gate_percentile
+    )
+    print(f"Gate threshold: {gate_threshold:+.4f}\n")
 
-        print(f"Looking up features for {project}-{bug_id}...")
-        feature_row = lookup_features(features_df, project, bug_id)
+    rows = []
+    processed = 0
+    errors = []
 
-        print(f"Computing localizability score ({args.threshold})...")
-        score, details_df = compute_score(feature_row, deltas_df, scaling_df)
+    for xml_file in xml_files:
+        try:
+            # Parse project and bug_id from filename (e.g. "Chart_1.xml" -> project="Chart", bug_id="1")
+            stem = xml_file.stem  # e.g. "Chart_1"
+            parts = stem.rsplit("_", 1)
+            if len(parts) != 2:
+                errors.append(f"{stem}: Cannot parse project/bug_id from filename. Expected format: Project_N.xml")
+                continue
+            
+            project, bug_id = parts[0], parts[1]
+            bug_id_str = f"{project}-{bug_id}"
 
-        print(f"Computing gate threshold (p{args.gate_percentile:.0f} across all bugs)...")
-        gate_threshold = compute_gate_threshold(
-            features_df, deltas_df, scaling_df, args.gate_percentile
-        )
+            # Parse bug report
+            bug_info = parse_bug_report(xml_file)
 
-        needs_augmentation = score < gate_threshold
+            # Look up features
+            try:
+                feature_row = lookup_features(features_df, project, bug_id)
+            except ValueError as e:
+                errors.append(f"{bug_id_str}: {str(e)}")
+                continue
 
-        print_report(bug_info, project, score, details_df, gate_threshold, needs_augmentation)
+            # Compute score
+            score, details_df = compute_score(feature_row, deltas_df, scaling_df)
+
+            # Determine if augmentation is needed
+            needs_augmentation = score < gate_threshold
+
+            # Get augmentation hints if needed
+            augmentation_hints = []
+            if needs_augmentation:
+                augmentation_hints = get_augmentation_hints(details_df)
+
+            # Collect results
+            rows.append({
+                "id": bug_id_str,
+                "project": project,
+                "bug_id": bug_id,
+                "score": score,
+                "gate_threshold": gate_threshold,
+                "needs_augmentation": needs_augmentation,
+                "augmentation_hints": "; ".join(augmentation_hints) if augmentation_hints else "",
+            })
+
+            processed += 1
+            if processed % 50 == 0:
+                print(f"Processed {processed}/{len(xml_files)} files...")
+
+        except Exception as e:
+            errors.append(f"{xml_file.name}: {str(e)}")
+            continue
+
+    # Create output DataFrame and save to CSV
+    if not rows:
+        print(f"\n{'='*65}")
+        print(f"  ERROR: No bugs were successfully processed.")
+        print(f"{'='*65}\n")
+        sys.exit(1)
+    
+    results_df = pd.DataFrame(rows)
+    results_df.to_csv(args.output, index=False)
+    
+    print(f"\n{'='*65}")
+    print(f"  PROCESSING COMPLETE")
+    print(f"{'='*65}")
+    print(f"  Processed: {processed}/{len(xml_files)} files")
+    print(f"  Output CSV: {args.output}")
+    print(f"  Bugs needing augmentation: {results_df['needs_augmentation'].sum()}")
+    
+    if errors:
+        print(f"\n  Errors encountered ({len(errors)}):")
+        for error in errors[:10]:  # Show first 10 errors
+            print(f"    - {error}")
+        if len(errors) > 10:
+            print(f"    ... and {len(errors) - 10} more errors")
+    
+    print(f"{'='*65}\n")
 
 
 if __name__ == "__main__":
